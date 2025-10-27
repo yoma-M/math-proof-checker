@@ -475,7 +475,8 @@ BC = DE
             // --- API Payload Construction for OCR ---
             let parts = [];
             
-            parts.push({ text: "この画像に手書き（または印刷）されている証明文の全文を、数式記号を含めて正確にテキストとして読み取り、JSON形式で返してください。それ以外のコメントは不要です。" });
+            // **OCRを安定させるため、AIにシンプルなテキスト抽出を要求**
+            parts.push({ text: "画像に手書きされた証明文の全文を、数式記号を含めて正確にテキストとして抽出してください。これ以外の情報は含めないでください。" });
 
             try {
                 const base64Data = await compressAndEncodeImage(imageFile);
@@ -494,24 +495,17 @@ BC = DE
                 return;
             }
             
+            // JSONスキーマを使わず、テキスト形式で抽出させるシンプルなペイロード
             const ocrPayload = {
                 contents: [{ parts: parts }],
                 systemInstruction: {
-                    parts: [{ text: "あなたはプロのOCR（光学文字認識）エキスパートです。画像からテキストを正確に抽出し、結果をJSONスキーマに従って返してください。" }]
+                    parts: [{ text: "あなたはプロのOCR（光学文字認識）エキスパートです。画像から証明文の全文を抽出してください。" }]
                 },
-                generationConfig: {
-                    responseMimeType: "application/json",
-                    responseSchema: {
-                        type: "OBJECT",
-                        properties: {
-                            "extractedText": { "type": "STRING", description: "画像から正確に読み取られた証明文の全文。" }
-                        },
-                        required: ["extractedText"]
-                    }
-                }
+                // generationConfig は省略し、デフォルトのテキスト生成を期待する
             };
             
             let response;
+            let extractedText = '';
             let maxRetries = 3;
             for (let i = 0; i < maxRetries; i++) {
                 try {
@@ -528,12 +522,18 @@ BC = DE
                     if (!response.ok) {
                         throw new Error(`API response status: ${response.status}`);
                     }
+                    
+                    const result = await response.json();
+                    extractedText = result.candidates?.[0]?.content?.parts?.[0]?.text || '';
+                    if (extractedText.trim() === '') {
+                         throw new Error("OCR returned empty text.");
+                    }
                     break; 
 
                 } catch (error) {
                     console.error("OCR Fetch attempt failed:", error);
                     if (i === maxRetries - 1) {
-                        feedbackOutput.innerHTML = `<p class="text-red-600 font-semibold">証明文の読み取り中にエラーが発生しました。時間をおいて再試行してください。</p>`;
+                        feedbackOutput.innerHTML = `<p class="text-red-600 font-semibold">証明文の読み取り中にエラーが発生しました。**画像を撮り直すか、直接テキストを入力**してから採点してください。</p>`;
                     }
                     if (i === maxRetries - 1) {
                         loadingIndicator.classList.add('hidden');
@@ -546,22 +546,19 @@ BC = DE
             
             // OCR結果の処理
             try {
-                const result = await response.json();
-                const jsonText = result.candidates?.[0]?.content?.parts?.[0]?.text;
-                const ocrResult = JSON.parse(jsonText);
-                
-                proofInput.value = ocrResult.extractedText.trim();
+                proofInput.value = extractedText.trim();
                 
                 feedbackOutput.innerHTML = `<p class="font-bold text-green-700">✅ 読み取りが完了しました！</p>
-                                            <p class="text-gray-700 mt-1">ステップ2に進みます。テキストエリアに読み取られた証明文が表示されています。誤字脱字がないか確認し、必要に応じて修正してください。</p>`;
+                                            <p class="text-gray-700 mt-1">ステップ2に進みます。テキストエリアに読み取られた証明文が表示されています。誤字脱字がないか**必ず確認し**、必要に応じて修正してください。</p>`;
 
                 loadingIndicator.classList.add('hidden');
                 updateButtons(); // ステップ2に進む (テキストありになる)
                 updateStepIndicator(2);
                 
             } catch (error) {
-                console.error("Error processing OCR response:", error);
-                feedbackOutput.innerHTML = `<p class="text-red-600 font-semibold">読み取ったテキストの処理中にエラーが発生しました。画像を別の角度で撮影し直すか、テキストで入力してください。</p>`;
+                // ここは実質的に到達しないが、念のため
+                console.error("Error setting OCR text:", error);
+                feedbackOutput.innerHTML = `<p class="text-red-600 font-semibold">読み取ったテキストの処理中に予期せぬエラーが発生しました。テキストで直接入力してください。</p>`;
             } finally {
                 loadingIndicator.classList.add('hidden');
                 ocrButton.disabled = false; // 失敗時も再挑戦できるようにする
