@@ -1,0 +1,700 @@
+import React, { useState, useEffect, useCallback } from 'react';
+import { Bot, FileText, CheckCircle, XCircle, Loader, TrendingUp, TrendingDown, Image, Upload, Save, Trash2, BookOpen, User } from 'lucide-react';
+
+// --- Firebase Imports ---
+import { initializeApp } from 'firebase/app';
+import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from 'firebase/auth';
+import { getFirestore, doc, setDoc, onSnapshot, collection, deleteDoc } from 'firebase/firestore';
+
+// --- Environment Variables ---
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
+const apiKey = ""; // API Key for Gemini API calls
+
+// API Utility Functions
+const MAX_RETRIES = 5;
+const INITIAL_BACKOFF_MS = 1000;
+
+/**
+ * 指数バックオフ付きでGemini APIを呼び出す関数
+ * @param {object} payload - APIに送信するJSONペイロード
+ * @returns {Promise<object>} - APIレスポンスのJSON
+ */
+const fetchWithExponentialBackoff = async (payload) => {
+    const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=${apiKey}`;
+
+    for (let i = 0; i < MAX_RETRIES; i++) {
+        try {
+            const response = await fetch(apiUrl, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            });
+
+            if (response.status === 429) {
+                // Rate limit exceeded - wait and retry
+                const delay = INITIAL_BACKOFF_MS * Math.pow(2, i) + Math.random() * 1000;
+                console.warn(`Rate limit exceeded (429). Retrying in ${Math.ceil(delay / 1000)}s...`);
+                await new Promise(resolve => setTimeout(resolve, delay));
+                continue;
+            }
+
+            if (!response.ok) {
+                throw new Error(`API Error: ${response.status} ${response.statusText}`);
+            }
+
+            return await response.json();
+
+        } catch (error) {
+            if (i === MAX_RETRIES - 1) {
+                throw new Error(`Failed to fetch from API after ${MAX_RETRIES} retries: ${error.message}`);
+            }
+        }
+    }
+};
+
+/**
+ * メインの採点ロジックを実行する関数
+ * @param {string|null} base64Image - Base64形式の画像データ
+ * @param {string|null} imageMimeType - 画像のMIMEタイプ
+ * @param {string} officialAnswer - 教師が用意した模範解答
+ * @returns {Promise<object>} - 採点結果のオブジェクト
+ */
+const gradeProof = async (base64Image, imageMimeType, officialAnswer) => {
+    // LLMに厳格な数学教師の役割を与えるシステムプロンプト
+    const systemPrompt = `
+        あなたは中学校の図形証明を専門とする、厳格で公正な数学教師です。
+        提供された画像から「問題文」と「生徒の証明」を正確に読み取ってください。
+        採点において、教師から提供された「模範解答」が存在する場合、その論理構造を絶対的な基準として使用し、生徒の解答との差異を厳しく評価してください。
+        満点は10点です。
+
+        評価基準：
+        1. 論理的な正しさ: 使用されている定理や前提は正しいか？
+        2. 構造と流れ: 証明は論理的に矛盾なく構成され、結論に達しているか？
+        3. 網羅性: 証明に必要な主要なステップ（仮定の明確化、合同/相似条件、結論）がすべて含まれているか？
+        4. 模範解答との比較: 教師から提供された模範解答と比較し、論理の欠落や記述の不一致を指摘してください。
+
+        採点方法:
+        - 10点: 完璧な証明。論理の飛躍や記述ミスがない。
+        - 7〜9点: 論理は正しいが、いくつかの重要なステップが省略されているか、記述に不明瞭な点がある。
+        - 4〜6点: 主要な論理ステップ（例：合同条件など）に誤りがあるか、重要な前提が欠落している。
+        - 0〜3点: 証明がまったく成立していないか、根本的な誤りがある。
+
+        すべての応答テキストは日本語で記述してください。
+    `;
+
+    // ユーザーへのクエリとコンテンツの構成
+    let userParts = [];
+
+    // 画像が提供された場合
+    userParts.push({
+        inlineData: {
+            mimeType: imageMimeType,
+            data: base64Image
+        }
+    });
+    
+    // 模範解答が存在する場合はクエリに含める
+    let answerText = "";
+    if (officialAnswer.trim()) {
+        answerText = `
+            【教師が提供した模範解答】
+            ${officialAnswer.trim()}
+            
+            **採点タスク**: 画像から読み取った生徒の証明を、上記模範解答と厳密に比較して採点してください。
+        `;
+    } else {
+        answerText = `
+            【教師が提供した模範解答】
+            提供されていません。AIが一般的な模範解答を想定して比較を行います。
+        `;
+    }
+
+    userParts.push({
+        text: `
+            【タスク】
+            1. 上の画像から、採点すべき「問題文」と「生徒の証明」を正確に読み取ってください。
+            2. 読み取った証明文を基に、厳格な数学教師として採点し、JSONスキーマに従って結果を出力してください。
+            
+            ${answerText}
+        `
+    });
+
+
+    // LLMに構造化されたJSON出力を強制するためのスキーマ
+    const responseSchema = {
+        type: "OBJECT",
+        properties: {
+            "score": { "type": "NUMBER", "description": "10点満点中の点数 (Score out of 10)" },
+            "critique": { "type": "STRING", "description": "全体的な評価とフィードバック (Overall evaluation and feedback)" },
+            "errors_found": {
+                "type": "ARRAY",
+                "description": "見つかった論理的または数学的な間違いのリスト (List of logical or mathematical errors found)",
+                "items": { "type": "STRING" }
+            },
+            "missing_steps": {
+                "type": "ARRAY",
+                "description": "証明を完成させるために不足している主要な論理ステップ (Key logical steps missing to complete the proof)",
+                "items": { "type": "STRING" }
+            },
+            "ai_suggested_official_answer": {
+                "type": "STRING",
+                "description": "教師が提供しなかった場合、AIが問題に基づいて提案する模範解答、または教師が提供した場合、それを要約したもの (AI suggested model answer based on the problem)"
+            }
+        },
+        "propertyOrdering": ["score", "critique", "errors_found", "missing_steps", "ai_suggested_official_answer"]
+    };
+
+    const payload = {
+        contents: [{ parts: userParts }],
+        systemInstruction: { parts: [{ text: systemPrompt }] },
+        generationConfig: {
+            responseMimeType: "application/json",
+            responseSchema: responseSchema
+        }
+    };
+
+    try {
+        const result = await fetchWithExponentialBackoff(payload);
+        const jsonText = result.candidates?.[0]?.content?.parts?.[0]?.text;
+
+        if (jsonText) {
+            // LLMはJSON文字列を返すので、パースする
+            return JSON.parse(jsonText);
+        } else {
+            throw new Error("APIから有効なJSON応答が得られませんでした。");
+        }
+    } catch (e) {
+        console.error("採点API呼び出し中にエラーが発生しました:", e);
+        throw e;
+    }
+};
+
+const ProofGrader = () => {
+    // --- State Management ---
+    const [imageFile, setImageFile] = useState(null);
+    const [imagePreviewUrl, setImagePreviewUrl] = useState(null);
+    const [imageMimeType, setImageMimeType] = useState(null);
+    
+    // 模範解答と管理のState
+    const [officialAnswer, setOfficialAnswer] = useState(""); 
+    const [savedModels, setSavedModels] = useState([]);
+    const [selectedModelId, setSelectedModelId] = useState('');
+    const [newModelName, setNewModelName] = useState('');
+
+    const [gradingResult, setGradingResult] = useState(null);
+    const [isLoading, setIsLoading] = useState(false);
+    const [error, setError] = useState('');
+    
+    // 削除確認のためのState
+    const [isConfirmingDelete, setIsConfirmingDelete] = useState(false);
+
+
+    // --- Firebase State ---
+    const [db, setDb] = useState(null);
+    const [auth, setAuth] = useState(null);
+    const [userId, setUserId] = useState(null);
+    const [isAuthReady, setIsAuthReady] = useState(false);
+
+    const COLLECTION_NAME = 'proof_models';
+
+    // 1. Firebase Initialization and Auth
+    useEffect(() => {
+        try {
+            const app = initializeApp(firebaseConfig);
+            const firestore = getFirestore(app);
+            const authService = getAuth(app);
+            setDb(firestore);
+            setAuth(authService);
+
+            onAuthStateChanged(authService, async (user) => {
+                if (user) {
+                    setUserId(user.uid);
+                } else {
+                    try {
+                        if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+                            await signInWithCustomToken(authService, __initial_auth_token);
+                            setUserId(authService.currentUser?.uid);
+                        } else {
+                            const anonUser = await signInAnonymously(authService);
+                            // 匿名ユーザーIDまたはランダムUUIDをFallbackとして使用
+                            setUserId(anonUser.user.uid || crypto.randomUUID()); 
+                        }
+                    } catch (e) {
+                        console.error("Firebase Auth Error:", e);
+                        setUserId(crypto.randomUUID()); // Fallback for error
+                    }
+                }
+                setIsAuthReady(true);
+            });
+
+        } catch (e) {
+            console.error("Firebase Initialization Error:", e);
+            setIsAuthReady(true);
+        }
+    }, []);
+
+    // 2. Firestore Data Listener (Saved Models)
+    useEffect(() => {
+        if (db && userId && isAuthReady) {
+            // Private Path: /artifacts/{appId}/users/{userId}/proof_models
+            const modelsRef = collection(db, 'artifacts', appId, 'users', userId, COLLECTION_NAME);
+            
+            const unsubscribe = onSnapshot(modelsRef, (snapshot) => {
+                const modelsList = snapshot.docs.map(doc => ({
+                    id: doc.id,
+                    ...doc.data()
+                }));
+                setSavedModels(modelsList);
+
+                // If the currently selected model is deleted, clear state
+                if (selectedModelId && !modelsList.find(m => m.id === selectedModelId)) {
+                    setSelectedModelId('');
+                    setOfficialAnswer('');
+                    setNewModelName('');
+                }
+            }, (error) => {
+                console.error("Firestore Error during snapshot:", error);
+                setError('データベースからの情報取得中にエラーが発生しました。');
+            });
+
+            return () => unsubscribe();
+        }
+    }, [db, userId, isAuthReady, selectedModelId]);
+
+    // --- Model Management Functions ---
+
+    // Model Selection Handler
+    const handleModelSelect = (e) => {
+        const modelId = e.target.value;
+        setSelectedModelId(modelId);
+        setIsConfirmingDelete(false); // 選択が変わったら削除確認をリセット
+
+        if (modelId) {
+            const selectedModel = savedModels.find(m => m.id === modelId);
+            if (selectedModel) {
+                setOfficialAnswer(selectedModel.answer);
+                setNewModelName(selectedModel.name);
+            }
+        } else {
+            setOfficialAnswer('');
+            setNewModelName('');
+        }
+    };
+
+    // Save Function (New or Update)
+    const saveModelAnswer = async () => {
+        if (!db || !userId || !newModelName.trim() || !officialAnswer.trim()) {
+            setError('模範解答名と解答内容を入力してください。');
+            return;
+        }
+        
+        setIsLoading(true);
+        setError('');
+        setIsConfirmingDelete(false); // 削除確認をリセット
+
+        try {
+            const docId = selectedModelId || crypto.randomUUID();
+            const docRef = doc(db, 'artifacts', appId, 'users', userId, COLLECTION_NAME, docId);
+            
+            await setDoc(docRef, {
+                name: newModelName.trim(),
+                answer: officialAnswer.trim(),
+                createdAt: new Date().toISOString()
+            }, { merge: true });
+
+            setSelectedModelId(docId);
+            // エラー表示領域を成功メッセージとして一時的に利用
+            setError(`模範解答「${newModelName}」を保存しました。`); 
+        } catch (e) {
+            console.error("Error saving model:", e);
+            setError('模範解答の保存中にエラーが発生しました。');
+        } finally {
+            setIsLoading(false);
+        }
+    };
+
+    // 削除確認トグル
+    const handleDeleteClick = () => {
+        if (!selectedModelId) return;
+        setIsConfirmingDelete(prev => !prev);
+        // 確認モードに入ったらエラーをクリア
+        if (!isConfirmingDelete) setError(''); 
+    };
+
+    // Delete Function
+    const deleteModelAnswer = async () => {
+        if (!selectedModelId || !db || !userId || !isConfirmingDelete) return;
+
+        setIsLoading(true);
+        setError('');
+        
+        try {
+            const docRef = doc(db, 'artifacts', appId, 'users', userId, COLLECTION_NAME, selectedModelId);
+            await deleteDoc(docRef);
+
+            setIsConfirmingDelete(false); // 削除成功
+            setError('模範解答を削除しました。');
+        } catch (e) {
+            console.error("Error deleting model:", e);
+            setError('模範解答の削除中にエラーが発生しました。');
+            setIsConfirmingDelete(false);
+        } finally {
+            setIsLoading(false);
+        }
+    };
+
+    // --- Image Handling ---
+    const handleImageChange = (e) => {
+        const file = e.target.files[0];
+        if (file) {
+            setImageFile(file);
+            setImageMimeType(file.type);
+            
+            const reader = new FileReader();
+            reader.onloadend = () => {
+                setImagePreviewUrl(reader.result);
+                setError('');
+            };
+            reader.readAsDataURL(file);
+        } else {
+            setImageFile(null);
+            setImagePreviewUrl(null);
+            setImageMimeType(null);
+        }
+        setIsConfirmingDelete(false); // 画像操作で削除確認をリセット
+    };
+
+    // --- Event Handler (Grading) ---
+    const handleGrade = async () => {
+        let currentBase64Image = null;
+
+        // 1. バリデーションチェック
+        if (!imageFile) {
+            setError('証明問題の画像をアップロードしてください。');
+            return;
+        }
+
+        setIsLoading(true);
+        setError('');
+        setGradingResult(null);
+        setIsConfirmingDelete(false); // 削除確認をリセット
+
+        // 2. 画像をBase64に変換
+        if (imageFile) {
+            try {
+                currentBase64Image = await new Promise((resolve, reject) => {
+                    const reader = new FileReader();
+                    reader.onloadend = () => {
+                        const base64String = reader.result.split(',')[1];
+                        resolve(base64String);
+                    };
+                    reader.onerror = reject;
+                    reader.readAsDataURL(imageFile);
+                });
+            } catch (e) {
+                setError('ファイルの読み込み中にエラーが発生しました。');
+                setIsLoading(false);
+                return;
+            }
+        }
+
+        // 3. 採点ロジックの実行
+        try {
+            const result = await gradeProof(currentBase64Image, imageMimeType, officialAnswer);
+            setGradingResult(result);
+        } catch (e) {
+            setError('採点処理中にエラーが発生しました。時間を置いて再度お試しください。');
+            console.error(e);
+        } finally {
+            setIsLoading(false);
+        }
+    };
+
+    // --- Helper Component for Status/Feedback Display ---
+    const FeedbackSection = ({ title, items, Icon, isError = false }) => (
+        <div className="mt-4 p-4 bg-white rounded-lg shadow-md border border-gray-200">
+            <h3 className={`text-xl font-semibold mb-3 flex items-center ${isError ? 'text-red-600' : 'text-gray-800'}`}>
+                <Icon className={`w-5 h-5 mr-2 ${isError ? 'text-red-500' : 'text-indigo-500'}`} />
+                {title}
+            </h3>
+            {items && items.length > 0 ? (
+                <ul className={`list-none space-y-2 ${isError ? 'text-red-700' : 'text-gray-700'}`}>
+                    {items.map((item, index) => (
+                        <li key={index} className="flex items-start">
+                            <span className={`mr-2 ${isError ? 'text-red-500' : 'text-indigo-500'} font-bold`}>
+                                {isError ? <TrendingDown className="w-4 h-4 mt-1" /> : <TrendingUp className="w-4 h-4 mt-1" />}
+                            </span>
+                            <span className="flex-1 text-sm leading-relaxed">{item}</span>
+                        </li>
+                    ))}
+                </ul>
+            ) : (
+                <p className="text-sm text-gray-500">
+                    {isError ? '指摘すべき重大な誤りはありませんでした。' : '不足している主要なステップはありませんでした。'}
+                </p>
+            )}
+        </div>
+    );
+
+    const isFirebaseLoading = !isAuthReady || !db;
+
+    return (
+        <div className="min-h-screen bg-gray-50 p-4 sm:p-8 font-sans">
+            <div className="max-w-4xl mx-auto">
+                {/* Header */}
+                <header className="text-center mb-8">
+                    <h1 className="text-4xl font-extrabold text-indigo-700 mb-2 flex items-center justify-center">
+                        <Bot className="w-8 h-8 mr-3 text-indigo-500" />
+                        証明問題採点アシスタント
+                    </h1>
+                    <p className="text-gray-500">図形証明の論理構造をAIが分析し、採点とフィードバックを生成します。</p>
+                </header>
+
+                {/* Input Area */}
+                <div className="bg-white p-6 rounded-xl shadow-2xl space-y-6 mb-8">
+                    {/* 1. Image Upload Area */}
+                    <div className="border-b border-gray-200 pb-4">
+                        <label htmlFor="file-upload" className="flex items-center text-sm font-medium text-gray-700 mb-2">
+                            <Image className="w-4 h-4 mr-2 text-red-500" />
+                            1. 証明問題の写真をアップロード
+                        </label>
+                        <div className="mt-1 flex justify-center px-6 pt-5 pb-6 border-2 border-gray-300 border-dashed rounded-lg hover:border-indigo-400 transition duration-150 relative">
+                            <input id="file-upload" name="file-upload" type="file" className="sr-only" onChange={handleImageChange} accept="image/jpeg, image/png" />
+                            <div className="space-y-1 text-center">
+                                {imagePreviewUrl ? (
+                                    <>
+                                        <img src={imagePreviewUrl} alt="証明問題のプレビュー" className="max-h-40 max-w-full mx-auto rounded-md shadow-lg border border-gray-200 object-contain" />
+                                        <p className="text-sm text-gray-500 mt-2">{imageFile.name} (アップロード済み)</p>
+                                    </>
+                                ) : (
+                                    <>
+                                        <Upload className="mx-auto h-8 w-8 text-gray-400" />
+                                        <div className="flex text-sm text-gray-600">
+                                            <label
+                                                htmlFor="file-upload"
+                                                className="relative cursor-pointer rounded-md bg-white font-medium text-indigo-600 hover:text-indigo-500 focus-within:outline-none focus-within:ring-2 focus-within:ring-indigo-500 focus-within:ring-offset-2"
+                                            >
+                                                <span>ファイルを選択</span>
+                                            </label>
+                                            <p className="pl-1">またはドラッグ＆ドロップ</p>
+                                        </div>
+                                        <p className="text-xs text-gray-500">JPG, PNGに対応 (最大4MB推奨)</p>
+                                    </>
+                                )}
+                            </div>
+                            {imagePreviewUrl && (
+                                <button
+                                    onClick={() => handleImageChange({ target: { files: [] } })}
+                                    className="absolute top-2 right-2 p-1 rounded-full bg-red-500 text-white hover:bg-red-600 transition"
+                                    aria-label="画像を削除"
+                                >
+                                    <XCircle className="w-4 h-4" />
+                                </button>
+                            )}
+                        </div>
+                        <p className="mt-2 text-xs text-gray-500">
+                            問題文と生徒の証明が書かれた画像をアップロードしてください。
+                        </p>
+                    </div>
+
+                    {/* 2. Model Answer Management (Teacher Provided) */}
+                    <div className="border-b border-gray-200 pb-4 space-y-4">
+                        <h3 className="text-lg font-bold flex items-center text-indigo-700">
+                            <BookOpen className="w-5 h-5 mr-2" />
+                            2. 模範解答の管理と選択
+                        </h3>
+                        <p className="text-xs text-red-600 font-semibold">
+                            <span className="font-bold">【教師専用】</span>これらの解答は、あなたのユーザーアカウントにのみ保存されます。
+                        </p>
+                        
+                        {/* Load/Select Answer */}
+                        <div className="flex items-center space-x-2">
+                            <label htmlFor="model-select" className="text-sm font-medium text-gray-700 whitespace-nowrap">
+                                登録済みの解答を選択:
+                            </label>
+                            <select
+                                id="model-select"
+                                value={selectedModelId}
+                                onChange={handleModelSelect}
+                                disabled={isFirebaseLoading || isLoading}
+                                className="flex-grow border border-gray-300 rounded-lg p-2 text-gray-800 focus:ring-indigo-500 focus:border-indigo-500 transition duration-150"
+                            >
+                                <option value="">-- 新規作成または選択 --</option>
+                                {savedModels.map(model => (
+                                    <option key={model.id} value={model.id}>{model.name}</option>
+                                ))}
+                            </select>
+                        </div>
+
+                        {/* Name Input */}
+                        <input
+                            type="text"
+                            value={newModelName}
+                            onChange={(e) => setNewModelName(e.target.value)}
+                            placeholder="模範解答のタイトルを入力 (例: 平行四辺形の対角線)"
+                            disabled={isFirebaseLoading || isLoading}
+                            className="w-full border border-gray-300 rounded-lg p-2 text-gray-800 focus:ring-indigo-500 focus:border-indigo-500 transition duration-150"
+                        />
+                        
+                        {/* Action Buttons */}
+                        <div className="flex space-x-3">
+                            <button
+                                onClick={saveModelAnswer}
+                                disabled={isFirebaseLoading || isLoading || !newModelName.trim() || !officialAnswer.trim()}
+                                className={`flex-1 flex items-center justify-center py-2 rounded-lg text-white font-semibold transition ${
+                                    isFirebaseLoading || isLoading || !newModelName.trim() || !officialAnswer.trim()
+                                        ? 'bg-gray-400 cursor-not-allowed'
+                                        : 'bg-green-600 hover:bg-green-700 shadow-md'
+                                }`}
+                            >
+                                <Save className="w-4 h-4 mr-2" />
+                                {selectedModelId ? '解答を更新' : '解答を新規保存'}
+                            </button>
+                            {/* 削除ボタンのトグルロジック */}
+                            <button
+                                onClick={isConfirmingDelete ? deleteModelAnswer : handleDeleteClick}
+                                disabled={isFirebaseLoading || isLoading || !selectedModelId}
+                                className={`flex-none w-28 flex items-center justify-center py-2 rounded-lg text-white font-semibold transition ${
+                                    isFirebaseLoading || isLoading || !selectedModelId
+                                        ? 'bg-gray-400 cursor-not-allowed'
+                                        : isConfirmingDelete
+                                            ? 'bg-red-700 hover:bg-red-800 shadow-lg'
+                                            : 'bg-red-500 hover:bg-red-600 shadow-md'
+                                }`}
+                            >
+                                {isConfirmingDelete ? (
+                                    <>
+                                        <Trash2 className="w-4 h-4 mr-1" />
+                                        本当に削除
+                                    </>
+                                ) : (
+                                    <>
+                                        <Trash2 className="w-4 h-4 mr-2" />
+                                        削除
+                                    </>
+                                )}
+                            </button>
+                        </div>
+                    </div>
+
+                    {/* 3. Official Answer Textarea */}
+                    <div className="border-b border-gray-200 pb-4">
+                        <label htmlFor="official-answer" className="flex items-center text-sm font-medium text-gray-700 mb-2">
+                            <FileText className="w-4 h-4 mr-2 text-indigo-500" />
+                            3. 模範解答の内容
+                        </label>
+                        <textarea
+                            id="official-answer"
+                            className="w-full min-h-[100px] border border-gray-300 rounded-lg p-3 text-gray-800 focus:ring-indigo-500 focus:border-indigo-500 transition duration-150 ease-in-out resize-y"
+                            value={officialAnswer}
+                            onChange={(e) => {setOfficialAnswer(e.target.value); setIsConfirmingDelete(false);}}
+                            placeholder="例: △ABCと△DEFにおいて、仮定よりAB=DE, BC=EF, CA=FD。よって、三組の辺がそれぞれ等しいので、△ABC ≡ △DEFである。"
+                        />
+                        <p className="mt-2 text-xs text-gray-500">
+                            この内容がAI採点時の論理的な比較基準として使用されます。
+                        </p>
+                    </div>
+
+                    {/* Grading Button and Loading */}
+                    <button
+                        onClick={handleGrade}
+                        disabled={isLoading || !imageFile}
+                        className={`w-full py-3 px-4 rounded-lg font-bold text-lg transition-all duration-200 shadow-md ${
+                            isLoading || !imageFile
+                                ? 'bg-indigo-300 text-white cursor-not-allowed'
+                                : 'bg-indigo-600 text-white hover:bg-indigo-700 active:bg-indigo-800 focus:outline-none focus:ring-4 focus:ring-indigo-500 focus:ring-opacity-50'
+                        } flex items-center justify-center`}
+                    >
+                        {isLoading ? (
+                            <>
+                                <Loader className="w-5 h-5 mr-2 animate-spin" />
+                                採点中... 画像解析と論理分析をしています
+                            </>
+                        ) : (
+                            <>
+                                <CheckCircle className="w-5 h-5 mr-2" />
+                                採点開始 (AI評価)
+                            </>
+                        )}
+                    </button>
+
+                    {/* Error Message */}
+                    {error && (
+                        <div className={`px-4 py-3 rounded relative ${error.includes('保存しました') || error.includes('削除しました') ? 'bg-green-100 border-green-400 text-green-700' : 'bg-red-100 border-red-400 text-red-700'}`} role="alert">
+                            <strong className="font-bold">{error.includes('保存しました') || error.includes('削除しました') ? '成功: ' : 'エラー: '}</strong>
+                            <span className="block sm:inline">{error}</span>
+                        </div>
+                    )}
+                </div>
+
+                {/* Result Display Area */}
+                {gradingResult && (
+                    <div className="bg-gray-800 p-6 rounded-xl shadow-2xl text-white">
+                        <h2 className="text-3xl font-extrabold mb-4 flex items-center border-b pb-2 border-gray-700">
+                            <Bot className="w-6 h-6 mr-2 text-green-400" />
+                            AI採点結果
+                        </h2>
+
+                        {/* Score Card */}
+                        <div className="flex items-baseline mb-6 bg-indigo-900 p-4 rounded-lg shadow-inner">
+                            <div className="text-5xl font-black mr-2 text-green-400">
+                                {gradingResult.score}
+                            </div>
+                            <div className="text-2xl text-indigo-200">
+                                / 10 点
+                            </div>
+                        </div>
+
+                        {/* Overall Critique */}
+                        <div className="mb-6 p-4 bg-gray-700 rounded-lg">
+                            <h3 className="text-xl font-semibold mb-2 flex items-center text-indigo-300">
+                                <FileText className="w-5 h-5 mr-2" />
+                                全体的な講評
+                            </h3>
+                            <p className="text-gray-200 leading-relaxed text-sm">{gradingResult.critique}</p>
+                        </div>
+                        
+                        {/* Model Answer Display (AI Suggested or Teacher Provided Summary) */}
+                        <div className="mb-6 p-4 bg-gray-700 rounded-lg">
+                            <h3 className="text-xl font-semibold mb-2 flex items-center text-indigo-300">
+                                <CheckCircle className="w-5 h-5 mr-2" />
+                                模範解答（採点基準）
+                            </h3>
+                            <p className="text-gray-200 leading-relaxed text-sm whitespace-pre-wrap">{gradingResult.ai_suggested_official_answer}</p>
+                        </div>
+
+
+                        {/* Details - Missing Steps */}
+                        <FeedbackSection
+                            title="不足している主要な論理ステップ"
+                            items={gradingResult.missing_steps}
+                            Icon={XCircle}
+                            isError={true}
+                        />
+
+                        {/* Details - Errors Found */}
+                        <FeedbackSection
+                            title="見つかった誤り（論理・記述）"
+                            items={gradingResult.errors_found}
+                            Icon={XCircle}
+                            isError={true}
+                        />
+
+                        <p className="mt-6 text-xs text-gray-500 text-center">
+                            この採点はAIによる補助的なものであり、最終的な評価は先生ご自身で行ってください。
+                        </p>
+                    </div>
+                )}
+                
+                {/* Footer with User ID */}
+                <footer className="mt-8 text-center text-gray-500 text-xs flex items-center justify-center">
+                    <User className="w-4 h-4 mr-2" />
+                    教師ユーザーID (模範解答データ保存先): {userId || '認証中...'}
+                </footer>
+            </div>
+        </div>
+    );
+};
+
+export default ProofGrader;
